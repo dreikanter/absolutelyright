@@ -1,0 +1,118 @@
+#!/usr/bin/env ruby
+
+require 'find'
+require 'json'
+
+def parse_log_entry(line)
+  return nil unless line.include?('{')
+
+  timestamp_part, json_part = line.split('{', 2)
+  json_part = '{' + json_part
+
+  begin
+    data = JSON.parse(json_part)
+    content = data.dig('message', 'content') || []
+
+    readable_text =
+      if content.is_a?(String)
+        content
+      else
+        text_parts = content
+          .select { |item| item.is_a?(Hash) && %w[text tool_result].include?(item['type']) }
+          .map { |item| item['text'] }
+
+        text_parts.empty? ? '' : text_parts.join(' ')
+      end
+
+    {
+      timestamp: data['timestamp'],
+      text: readable_text
+    }
+  rescue JSON::ParserError => e
+    { timestamp: nil, text: "Error parsing line: #{e.message}" }
+  end
+end
+
+def find_claude_logs
+  log_files = []
+
+  # Search for Claude Code session logs in ~/.claude/projects
+  projects_path = "#{ENV['HOME']}/.claude/projects"
+
+  if Dir.exist?(projects_path)
+    Find.find(projects_path) do |path|
+      if File.file?(path) && path.match?(/\.jsonl$/i)
+        # Check if file was modified recently (within last 24 hours for active sessions)
+        if File.mtime(path) > Time.now - 86400
+          log_files << path
+        end
+      end
+    rescue StandardError
+      # Skip inaccessible directories
+    end
+  end
+
+  log_files
+end
+
+def process_logs(log_files)
+  if log_files.empty?
+    puts "No active Claude Code session logs found."
+    puts "Searched location: ~/.claude/projects"
+    return
+  end
+
+  if ARGV.empty?
+    # Default behavior - tail and look for "You're absolutely right"
+    puts "Found #{log_files.length} active Claude Code session log(s):"
+    log_files.each { |file| puts "  - #{file}" }
+    puts "\nTailing all Claude Code session logs (Ctrl+C to stop)..."
+    puts "Looking for: \"You're absolutely right\"\n\n"
+
+    count = 0
+    IO.popen("tail -f #{log_files.map { |f| "\"#{f}\"" }.join(' ')}") do |pipe|
+      pipe.each_line do |line|
+        if line.include?("You're absolutely right")
+          count += 1
+          parsed = parse_log_entry(line.strip)
+          puts "🎯 Match ##{count}: Found \"You're absolutely right\""
+
+          if parsed && parsed.is_a?(Hash) && parsed[:timestamp]
+            puts parsed[:timestamp]
+            puts
+            puts parsed[:text]
+          else
+            puts "   #{line.strip}"
+          end
+          puts
+        end
+      end
+    end
+  else
+    # Parse mode - extract human readable text from all logs
+    puts "Extracting human readable text from log files...\n\n"
+
+    log_files.each do |file|
+      puts "=== #{file} ==="
+      File.foreach(file) do |line|
+        parsed = parse_log_entry(line.strip)
+        if parsed && parsed[:timestamp]
+          puts "#{parsed[:timestamp]} - #{parsed[:text]}"
+        end
+      end
+      puts
+    end
+  end
+end
+
+# Main execution
+if ARGV.include?('--help') || ARGV.include?('-h')
+  puts "Usage: #{$0} [parse]"
+  puts "  No arguments: Tail logs and look for 'You're absolutely right'"
+  puts "  parse: Extract human readable text and timestamps from all log entries"
+  exit 0
+end
+
+puts "Searching for active Claude session logs..."
+log_files = find_claude_logs
+process_logs(log_files)
